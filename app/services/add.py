@@ -1,0 +1,245 @@
+from __future__ import annotations
+
+import hashlib
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+
+from app.embedding import EmbeddingClient, EmbeddingError
+from app.errors import InvalidInput, Unavailable
+from app.policy import (
+    MAX_CONTENT_CHARS,
+    MAX_IDENTIFIER_CHARS,
+    MAX_MESSAGES_PER_ADD,
+    NEARBY_SPAN,
+    Policy,
+)
+from app.storage.repository import MessageRepository, NewMessage
+from app.text import ms_to_iso, utc_now
+from app.timefmt import format_time
+
+_ROLES = frozenset({"user", "assistant"})
+
+
+FEEDBACK_PREFIX = "streaming online qa feedback:"
+SPLIT_ABOVE_CHARS = 3_000
+SPLIT_CHUNK_CHARS = 1_200
+SPLIT_HEADER_CHARS = 120
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?;。！？；])\s+|(?<=\n)")
+
+
+def _hard_wrap(paragraph: str, limit: int) -> list[str]:
+    if len(paragraph) <= limit:
+        return [paragraph]
+    pieces: list[str] = []
+    current = ""
+    for sentence in _SENTENCE_END.split(paragraph):
+        if not sentence:
+            continue
+        if len(sentence) > limit:
+            if current:
+                pieces.append(current)
+                current = ""
+            for offset in range(0, len(sentence), limit):
+                pieces.append(sentence[offset : offset + limit])
+            continue
+        if current and len(current) + len(sentence) + 1 > limit:
+            pieces.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip() if current else sentence
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _split_long(content: str) -> list[str]:
+    if len(content) <= SPLIT_ABOVE_CHARS:
+        return [content]
+    first_line = content.strip().split("\n", 1)[0][:SPLIT_HEADER_CHARS]
+    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+    pieces: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        for chunk in _hard_wrap(paragraph, SPLIT_CHUNK_CHARS):
+            if current and len(current) + len(chunk) + 2 > SPLIT_CHUNK_CHARS:
+                pieces.append(current)
+                current = chunk
+            else:
+                current = f"{current}\n\n{chunk}".strip() if current else chunk
+    if current:
+        pieces.append(current)
+    if len(pieces) <= 1:
+        return [content]
+    return [
+        piece if piece.startswith(first_line) else f"{first_line}\n\n{piece}"
+        for piece in pieces
+    ]
+
+
+def _content_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_feedback(content: str) -> bool:
+    return content.lstrip().lower().startswith(FEEDBACK_PREFIX)
+
+
+@dataclass(frozen=True, slots=True)
+class IncomingMessage:
+    role: str
+    content: str
+    timestamp: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AddResult:
+    inserted: int
+    skipped: int
+
+
+class AddService:
+    def __init__(
+        self,
+        repository: MessageRepository,
+        policy: Policy,
+        embedding: EmbeddingClient,
+    ) -> None:
+        if embedding is None:
+            raise ValueError("embedding is required")
+        self._repo = repository
+        self._policy = policy
+        self._embedding = embedding
+
+    def add(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        session_id: str,
+        messages: Sequence[IncomingMessage],
+    ) -> AddResult:
+        request_id = self._required(
+            request_id,
+            field="request_id",
+            max_chars=MAX_IDENTIFIER_CHARS,
+        )
+        user_id = self._required(user_id, field="user_id", max_chars=MAX_IDENTIFIER_CHARS)
+        session_id = self._required(
+            session_id,
+            field="session_id",
+            max_chars=MAX_IDENTIFIER_CHARS,
+        )
+        if not messages:
+            raise InvalidInput("messages must not be empty", details={"field": "messages"})
+        if len(messages) > MAX_MESSAGES_PER_ADD:
+            raise InvalidInput(
+                f"at most {MAX_MESSAGES_PER_ADD} messages per request",
+                details={"field": "messages", "count": len(messages)},
+            )
+
+        now = utc_now()
+        rows = []
+        for index, message in enumerate(messages):
+            prepared = self._prepare(index, message, now)
+            for piece in _split_long(message.content):
+                rows.append(
+                    replace(
+                        prepared,
+                        content=piece,
+                        is_feedback=_is_feedback(piece),
+                    )
+                    if piece != message.content
+                    else replace(prepared, is_feedback=_is_feedback(piece))
+                )
+        for position, row in enumerate(rows):
+            rows[position] = replace(row, position=position)
+        self._attach_context(rows)
+        texts = [row.render() for row in rows]
+        digests = [_content_digest(text) for text in texts]
+        space = self._embedding.space
+        dimension = self._embedding.dimension
+        cached = self._repo.cached_vectors(space, digests, dimension)
+        missing = [index for index, digest in enumerate(digests) if digest not in cached]
+        if missing:
+            try:
+                fresh = self._embedding.embed_documents([texts[index] for index in missing])
+            except (EmbeddingError, ValueError) as exc:
+                raise Unavailable("embedding service is unavailable") from exc
+            if len(fresh) != len(missing):
+                raise Unavailable("embedding service returned an invalid result")
+            self._repo.store_vectors(
+                space,
+                [(digests[index], vector) for index, vector in zip(missing, fresh, strict=True)],
+            )
+            for index, vector in zip(missing, fresh, strict=True):
+                cached[digests[index]] = vector
+        vectors = [cached[digest] for digest in digests]
+        result = self._repo.insert_many(
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            rows=rows,
+            vectors=vectors,
+            space=self._embedding.space,
+            model=self._embedding.model,
+        )
+        return AddResult(inserted=len(result.ids), skipped=result.skipped)
+
+    def _attach_context(self, rows: list[NewMessage]) -> None:
+        window = max(0, int(NEARBY_SPAN))
+        if window == 0:
+            return
+        texts = [row.render() for row in rows]
+        for index, row in enumerate(rows):
+            lo, hi = max(0, index - window), min(len(rows), index + window + 1)
+            neighbours = [texts[j] for j in range(lo, hi) if j != index]
+            rows[index] = replace(row, nearby_text="\n".join(neighbours))
+
+    def _prepare(self, position: int, message: IncomingMessage, now: str) -> NewMessage:
+        role = self._required(
+            message.role, field=f"messages[{position}].role", max_chars=MAX_IDENTIFIER_CHARS
+        )
+        if role not in _ROLES:
+            raise InvalidInput(
+                f"messages[{position}].role must be one of {sorted(_ROLES)}",
+                details={"field": f"messages[{position}].role"},
+            )
+        content = message.content
+        if not content.strip():
+            raise InvalidInput(
+                f"messages[{position}].content must not be blank",
+                details={"field": f"messages[{position}].content"},
+            )
+        if len(content) > MAX_CONTENT_CHARS:
+            raise InvalidInput(
+                f"messages[{position}].content must be at most "
+                f"{MAX_CONTENT_CHARS} characters",
+                details={"field": f"messages[{position}].content", "length": len(content)},
+            )
+        if message.timestamp is not None and message.timestamp < 0:
+            raise InvalidInput(
+                f"messages[{position}].timestamp must be a non-negative Unix millisecond",
+                details={"field": f"messages[{position}].timestamp"},
+            )
+        return NewMessage(
+            position=position,
+            role=role,
+            content=content,
+            timestamp=message.timestamp,
+            created_at=(ms_to_iso(message.timestamp) if message.timestamp is not None else now),
+            time_text=format_time(message.timestamp),
+        )
+
+    @staticmethod
+    def _required(value: str, *, field: str, max_chars: int) -> str:
+        if not value.strip():
+            raise InvalidInput(f"{field} must not be empty", details={"field": field})
+        if len(value) > max_chars:
+            raise InvalidInput(
+                f"{field} must be at most {max_chars} characters",
+                details={"field": field, "length": len(value)},
+            )
+        return value

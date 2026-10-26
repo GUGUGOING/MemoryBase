@@ -1,0 +1,28 @@
+{
+  "embedding": {
+    "enabled": true,
+    "url": "http://<host>:<port>/v1/embeddings",
+    "model": "<model-name>",
+    "dimension": 0,
+    "query_template": "{query}",
+    "document_template": "{document}",
+    "batch_size": 10,
+    "batch_max_chars": 16000,
+    "max_input_chars": 12000,
+    "timeout_seconds": 60,
+    "retries": 3,
+    "api_key_env": "",
+    "tiebreak_weight": 0.0,
+    "send_dimensions": false
+  },
+  "rerank": {
+    "enabled": false,
+    "url": "http://<host>:<port>/v1/rerank",
+    "model": "<rerank-model-name>",
+    "timeout_seconds": 10,
+    "retries": 2,
+    "batch_size": 64,
+    "failure_threshold": 3,
+    "cooldown_seconds": 60
+  }
+}
