@@ -17,3 +17,4 @@ config/config.local.json
 .env
 *.env
 env
+.idea/
