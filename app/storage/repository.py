@@ -76,7 +76,6 @@ class NewMessage:
     created_at: str
     nearby_text: str = ""
     time_text: str = ""
-    is_feedback: bool = False
 
     def render(self) -> str:
         return f"{self.time_text} {self.content}".strip()
@@ -174,9 +173,8 @@ class MessageRepository:
                     """
                     INSERT OR IGNORE INTO messages
                         (request_id, position, user_id, session_id, role,
-                         content, source_content, search_text, nearby_text, timestamp, created_at,
-                         is_feedback)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         content, source_content, search_text, nearby_text, timestamp, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         request_id,
@@ -190,7 +188,6 @@ class MessageRepository:
                         row.nearby_text,
                         row.timestamp,
                         row.created_at,
-                        1 if row.is_feedback else 0,
                     ),
                 )
                 if cursor.rowcount == 1:
@@ -304,7 +301,6 @@ class MessageRepository:
               FROM message_vectors
               JOIN messages ON messages.id = message_vectors.message_id
              WHERE messages.user_id = ? AND message_vectors.space = ?
-               AND messages.is_feedback = 0
             """,
             (user_id, space),
         ).fetchall()

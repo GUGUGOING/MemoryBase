@@ -21,7 +21,6 @@ from app.timefmt import format_time
 _ROLES = frozenset({"user", "assistant"})
 
 
-FEEDBACK_PREFIX = "streaming online qa feedback:"
 SPLIT_ABOVE_CHARS = 3_000
 SPLIT_CHUNK_CHARS = 1_200
 SPLIT_HEADER_CHARS = 120
@@ -83,10 +82,6 @@ def _content_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _is_feedback(content: str) -> bool:
-    return content.lstrip().lower().startswith(FEEDBACK_PREFIX)
-
-
 @dataclass(frozen=True, slots=True)
 class IncomingMessage:
     role: str
@@ -146,13 +141,9 @@ class AddService:
             prepared = self._prepare(index, message, now)
             for piece in _split_long(message.content):
                 rows.append(
-                    replace(
-                        prepared,
-                        content=piece,
-                        is_feedback=_is_feedback(piece),
-                    )
+                    replace(prepared, content=piece)
                     if piece != message.content
-                    else replace(prepared, is_feedback=_is_feedback(piece))
+                    else prepared
                 )
         for position, row in enumerate(rows):
             rows[position] = replace(row, position=position)

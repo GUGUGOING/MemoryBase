@@ -4,7 +4,7 @@ import unittest
 
 from app.embedding import blob_to_vector, vector_to_blob
 from app.query import clip_query
-from app.services.add import _is_feedback, _split_long
+from app.services.add import _split_long
 from app.text import cjk_bigrams, fts_query, trigram_query
 
 
@@ -38,18 +38,6 @@ class SplitLongTest(unittest.TestCase):
 
     def test_empty_content_round_trips(self) -> None:
         self.assertEqual(_split_long(""), [""])
-
-
-class FeedbackDetectionTest(unittest.TestCase):
-    def test_prefix_is_case_and_space_insensitive(self) -> None:
-        self.assertTrue(_is_feedback("  STREAMING ONLINE QA FEEDBACK: {\"x\": 1}"))
-        self.assertTrue(_is_feedback("Streaming online QA feedback:\n{}"))
-
-    def test_other_streaming_messages_are_not_feedback(self) -> None:
-        self.assertFalse(
-            _is_feedback('Streaming intra-transfer train trajectory: {"task_index": 1}')
-        )
-        self.assertFalse(_is_feedback("Streaming model update notes"))
 
 
 class QueryInjectionTest(unittest.TestCase):
